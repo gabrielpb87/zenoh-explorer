@@ -6,7 +6,8 @@ edition = "2021"
 [dependencies]
 chrono = "0.4.41"
 colored = "3.0.0"
-eframe = "0.31.1"
-egui = "0.31.1"
-tokio = "1.44.2"
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.28"
+egui_plot = "0.28"
+tokio = { version = "1.44.2", features = ["full"] }
 zenoh = "1.3.4"
