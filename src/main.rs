@@ -7,7 +7,12 @@ mod ui;
 mod topic_node;
 
 fn main() -> Result<(), eframe::Error> {
-    // Set up panic handler with backtrace
+    // Fix for WSL: unset WAYLAND_DISPLAY if socket doesn't exist
+    if !wayland_socket_exists() {
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+    }
+
     panic::set_hook(Box::new(|panic_info| {
         let mut stderr = std::io::stderr();
         let _ = writeln!(stderr, "\n========== PANIC ==========");
@@ -28,21 +33,18 @@ fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = env::args().collect();
     let config_path = args.get(1).cloned();
 
-    eprintln!("Creating window options...");
     let options = NativeOptions {
         viewport: ViewportBuilder::default()
             .with_inner_size(egui::vec2(1200.0, 800.0))
-            .with_min_inner_size(egui::vec2(800.0, 600.0)),
+            .with_min_inner_size(egui::vec2(800.0, 600.0))
+            .with_maximized(true), // <-- maximized at startup
         ..Default::default()
     };
 
-    eprintln!("Initializing eframe...");
     let result = eframe::run_native(
         "Zenoh Explorer",
         options,
         Box::new(move |cc| {
-            eprintln!("Creating App instance...");
-            // Enable better rendering
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(crate::ui::App::new(config_path.as_deref())) as Box<dyn eframe::App>)
         })
@@ -50,4 +52,14 @@ fn main() -> Result<(), eframe::Error> {
 
     eprintln!("eframe exited with: {:?}", result);
     result
+}
+
+fn wayland_socket_exists() -> bool {
+    if let Ok(display) = std::env::var("WAYLAND_DISPLAY") {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| "/run/user/1000".to_string());
+        std::path::Path::new(&format!("{}/{}", runtime_dir, display)).exists()
+    } else {
+        false
+    }
 }

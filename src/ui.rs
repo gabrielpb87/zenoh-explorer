@@ -6,11 +6,18 @@ use std::collections::VecDeque;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints, Legend, PlotBounds};
 use zenoh::Config;
-use crate::topic_node::TopicNode;
+use crate::topic_node::{TopicNode, parse_numeric};
 
 const MAX_MESSAGES_PER_TOPIC: usize = 1000;
 const OSCILLOSCOPE_TIME_WINDOW: f64 = 10.0;
 const UPDATE_INTERVAL_MS: u64 = 33; // ~30 FPS
+
+const MIN_SCOPE_HEIGHT_PX: f32 = 300.0;
+const MIN_SCOPE_WIDTH_PX: f32 = 380.0;
+
+const MIN_COMBINED_SCOPE_HEIGHT_PX: f32 = MIN_SCOPE_HEIGHT_PX * 1.2;
+
+const MAX_VISIBLE_ROWS: usize = 5; // includes combined scope row
 
 #[derive(PartialEq, Clone, Copy)]
 enum ViewMode {
@@ -23,6 +30,8 @@ pub struct App {
     search_filter: String,
     view_mode: ViewMode,
     selected_topics: Vec<String>,
+    /// Topics shown together in the combined (overlay) scope.
+    combined_scope_topics: Vec<String>,
     available_topics: Vec<String>,
     oscilloscope_data: Arc<Mutex<OscilloscopeData>>,
     frame_count: u64,
@@ -38,10 +47,10 @@ impl OscilloscopeData {
     fn add_sample(&mut self, topic: &str, value: f64) {
         let start = self.start_time.get_or_insert_with(std::time::Instant::now);
         let elapsed = start.elapsed().as_secs_f64();
-        
+
         let data = self.topic_data.entry(topic.to_string()).or_insert_with(VecDeque::new);
         data.push_back((elapsed, value));
-        
+
         while let Some((time, _)) = data.front() {
             if elapsed - time > OSCILLOSCOPE_TIME_WINDOW * 2.0 {
                 data.pop_front();
@@ -50,12 +59,12 @@ impl OscilloscopeData {
             }
         }
     }
-    
+
     fn get_data_in_window(&self, topic: &str) -> Vec<[f64; 2]> {
         if let Some(start) = self.start_time {
             let current_time = start.elapsed().as_secs_f64();
             let window_start = current_time - OSCILLOSCOPE_TIME_WINDOW;
-            
+
             if let Some(data) = self.topic_data.get(topic) {
                 return data.iter()
                     .filter(|(t, _)| *t >= window_start)
@@ -65,7 +74,7 @@ impl OscilloscopeData {
         }
         Vec::new()
     }
-    
+
     fn get_current_time(&self) -> f64 {
         self.start_time
             .map(|start| start.elapsed().as_secs_f64())
@@ -76,7 +85,7 @@ impl OscilloscopeData {
 impl App {
     pub fn new(config_path: Option<&str>) -> Self {
         eprintln!("App::new() called");
-        
+
         let topic_root = Arc::new(Mutex::new(TopicNode {
             name: "root".to_string(),
             ..Default::default()
@@ -106,10 +115,10 @@ impl App {
                     return;
                 }
             };
-            
+
             rt.block_on(async move {
                 zenoh::init_log_from_env_or("error");
-                
+
                 match zenoh::open(config).await {
                     Ok(session) => {
                         eprintln!("Zenoh session opened");
@@ -119,13 +128,14 @@ impl App {
                                 while let Ok(sample) = subscriber.recv_async().await {
                                     let topic = sample.key_expr().as_str();
                                     let path: Vec<&str> = topic.split('/').collect();
-                                    
+
                                     let payload = sample.payload()
                                         .try_to_string()
                                         .map(|cow| cow.into_owned())
                                         .unwrap_or_else(|e| e.to_string());
 
-                                    if let Ok(value) = payload.trim().parse::<f64>() {
+                                    // Try to parse payload data to accept booleans as numeric
+                                    if let Some(value) = parse_numeric(&payload) {
                                         if let Ok(mut osc) = osc_clone.lock() {
                                             osc.add_sample(topic, value);
                                         }
@@ -149,12 +159,13 @@ impl App {
         });
 
         eprintln!("App::new() completed");
-        
-        App { 
+
+        App {
             topic_root,
             search_filter: String::new(),
             view_mode: ViewMode::TreeView,
             selected_topics: Vec::new(),
+            combined_scope_topics: Vec::new(),
             available_topics: Vec::new(),
             oscilloscope_data,
             frame_count: 0,
@@ -184,22 +195,21 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading("🔍 Zenoh Explorer");
                 ui.separator();
-                
+
                 ui.label("View:");
                 ui.selectable_value(&mut self.view_mode, ViewMode::TreeView, "📁 Tree");
                 ui.selectable_value(&mut self.view_mode, ViewMode::OscilloscopeView, "📊 Oscilloscope");
-                
+
                 ui.separator();
-                
+
                 if self.view_mode == ViewMode::TreeView {
                     ui.label("Filter:");
                     ui.text_edit_singleline(&mut self.search_filter);
-                    
                     if ui.button("Clear Filter").clicked() {
                         self.search_filter.clear();
                     }
                 }
-                
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Clear All").clicked() {
                         if let Ok(mut tree) = self.topic_root.lock() {
@@ -230,31 +240,33 @@ impl eframe::App for App {
                 });
             }
             ViewMode::OscilloscopeView => {
+                // ── Side panel: topic selector ──────────────────────────────
                 egui::SidePanel::left("topic_selector")
-                    .default_width(250.0)
+                    .default_width(260.0)
                     .show(ctx, |ui| {
                         ui.heading("Select Topics");
                         ui.separator();
-                        
+
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             let topics = self.available_topics.clone();
                             
                             // Get oscilloscope data to check which topics have numeric values
                             let osc_data = self.oscilloscope_data.lock().ok();
-                            
+
                             for topic in &topics {
                                 // Check if topic has numeric data
                                 let has_numeric_data = osc_data
                                     .as_ref()
-                                    .and_then(|data| data.topic_data.get(topic))
-                                    .map(|data| !data.is_empty())
+                                    .and_then(|d| d.topic_data.get(topic))
+                                    .map(|d| !d.is_empty())
                                     .unwrap_or(false);
-                                
+
                                 let mut is_selected = self.selected_topics.contains(topic);
-                                
+                                let in_combined = self.combined_scope_topics.contains(topic);
+
                                 ui.horizontal(|ui| {
                                     if has_numeric_data {
-                                        // Normal checkbox for numeric topics
+                                        // Individual scope checkbox
                                         if ui.checkbox(&mut is_selected, "").changed() {
                                             if is_selected {
                                                 self.selected_topics.push(topic.clone());
@@ -262,37 +274,319 @@ impl eframe::App for App {
                                                 self.selected_topics.retain(|t| t != topic);
                                             }
                                         }
+
+                                        // "➕" button adds to combined scope
+                                        let combined_label = if in_combined { "✖" } else { "➕" };
+                                        let combined_tooltip = if in_combined {
+                                            "Remove from combined scope"
+                                        } else {
+                                            "Add to combined scope"
+                                        };
+                                        if ui.button(combined_label)
+                                            .on_hover_text(combined_tooltip)
+                                            .clicked()
+                                        {
+                                            if in_combined {
+                                                self.combined_scope_topics.retain(|t| t != topic);
+                                            } else {
+                                                self.combined_scope_topics.push(topic.clone());
+                                            }
+                                        }
+
                                         ui.label(topic);
                                     } else {
-                                        // Disabled checkbox for non-numeric topics
                                         ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
+                                        ui.add_enabled(false, egui::Button::new("➕"));
                                         ui.label(
-                                            egui::RichText::new(format!("{} (not numerical value)", topic))
+                                            egui::RichText::new(format!("{} (non-numeric)", topic))
                                                 .color(egui::Color32::GRAY)
                                         );
                                     }
                                 });
                             }
                         });
-                        
+
                         ui.separator();
-                        if ui.button("Clear Selection").clicked() {
-                            self.selected_topics.clear();
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Clear Selection").clicked() {
+                                self.selected_topics.clear();
+                            }
+                            if ui.button("Clear Combined").clicked() {
+                                self.combined_scope_topics.clear();
+                            }
+                        });
                     });
 
+                // ── Central panel: combined scope + individual grid ──────────
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if self.selected_topics.is_empty() {
+                    let has_combined = !self.combined_scope_topics.is_empty();
+                    let has_individual = !self.selected_topics.is_empty();
+
+                    if !has_combined && !has_individual {
                         ui.centered_and_justified(|ui| {
-                            ui.label("Select topics from the left panel to visualize");
+                            ui.label("Select topics from the left panel to visualize.\nUse ➕ to add signals to the combined scope.");
                         });
-                    } else {
-                        draw_oscilloscope_realtime(ui, &self.oscilloscope_data, &self.selected_topics);
+                        return;
                     }
+
+                    // Combined scope occupies 1 row when present
+                    let combined_rows_used: usize = if has_combined { 1 } else { 0 };
+                    let max_individual_rows = MAX_VISIBLE_ROWS.saturating_sub(combined_rows_used);
+
+                    let combined_scope_height = if has_combined {
+                        MIN_COMBINED_SCOPE_HEIGHT_PX + 40.0 // plot + label + separator
+                    } else {
+                        0.0
+                    };
+
+                    // Compute individual grid dimensions to cap visible height
+                    let num_cols = if has_individual {
+                        compute_columns(ui.available_width(), self.selected_topics.len())
+                    } else {
+                        1
+                    };
+                    let num_rows = if has_individual {
+                        (self.selected_topics.len() + num_cols - 1) / num_cols
+                    } else {
+                        0
+                    };
+                    let visible_rows = num_rows.min(max_individual_rows);
+                    let individual_visible_height = visible_rows as f32 * (MIN_SCOPE_HEIGHT_PX + ui.spacing().item_spacing.y);
+
+                    // Total visible area before scroll
+                    let max_visible_height = combined_scope_height + individual_visible_height;
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .max_height(max_visible_height) // <── caps visible area, enables scroll beyond
+                        .show(ui, |ui| {
+                            if has_combined {
+                                draw_combined_scope(
+                                    ui,
+                                    &self.oscilloscope_data,
+                                    &self.combined_scope_topics,
+                                );
+                                ui.separator();
+                            }
+
+                            if has_individual {
+                                draw_oscilloscope_grid(
+                                    ui,
+                                    &self.oscilloscope_data,
+                                    &self.selected_topics,
+                                );
+                            }
+                        });
                 });
             }
         }
     }
+}
+
+// ── Combined scope: all selected signals overlaid on one plot ────────────────
+
+fn draw_combined_scope(
+    ui: &mut egui::Ui,
+    oscilloscope_data: &Arc<Mutex<OscilloscopeData>>,
+    topics: &[String],
+) {
+    let osc_data = match oscilloscope_data.lock() {
+        Ok(d) => d,
+        Err(_) => {
+            ui.label("Error: Unable to access oscilloscope data");
+            return;
+        }
+    };
+
+    let current_time = osc_data.get_current_time();
+    let window_start = (current_time - OSCILLOSCOPE_TIME_WINDOW).max(0.0);
+
+    let colors = scope_colors();
+
+    ui.label(
+        egui::RichText::new("🔀 Combined Scope")
+            .strong()
+            .size(14.0),
+    );
+
+    let available_width = ui.available_width();
+
+    // Compute global Y range across all combined topics
+    let all_data: Vec<Vec<[f64; 2]>> = topics
+        .iter()
+        .map(|t| osc_data.get_data_in_window(t))
+        .collect();
+
+    let (y_min, y_max) = {
+        let merged: Vec<[f64; 2]> = all_data.iter().flatten().copied().collect();
+        compute_y_range(&merged)
+    };
+
+    Plot::new("combined_scope")
+        .height(MIN_COMBINED_SCOPE_HEIGHT_PX)
+        .width(available_width)
+        .legend(Legend::default().text_style(egui::TextStyle::Body))
+        .show_axes([true, true])
+        .show_grid([true, true])
+        .allow_zoom(false)
+        .allow_drag(false)
+        .allow_scroll(false)
+        .include_x(window_start)
+        .include_x(current_time)
+        .include_y(y_min)
+        .include_y(y_max)
+        .show(ui, |plot_ui| {
+            plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                [window_start, y_min],
+                [current_time, y_max],
+            ));
+
+            for (idx, (topic, data)) in topics.iter().zip(all_data.iter()).enumerate() {
+                if !data.is_empty() {
+                    let color = colors[idx % colors.len()];
+                    let points: PlotPoints = data.clone().into();
+                    plot_ui.line(
+                        Line::new(points)
+                            .color(color)
+                            .name(topic)
+                            .width(2.0),
+                    );
+                }
+            }
+        });
+}
+
+// ── Individual scopes grid ───────────────────────────────────────────────────
+
+fn compute_columns(available_width: f32, scope_count: usize) -> usize {
+    let max_cols_by_width = ((available_width / MIN_SCOPE_WIDTH_PX) as usize).max(1);
+    let preferred = match scope_count {
+        1 => 1,
+        2 => 2,
+        3..=4 => 2,
+        _ => 3,
+    };
+    preferred.min(max_cols_by_width).min(scope_count)
+}
+
+fn scope_colors() -> [egui::Color32; 8] {
+    [
+        egui::Color32::from_rgb(255, 100, 100),
+        egui::Color32::from_rgb(100, 255, 100),
+        egui::Color32::from_rgb(100, 100, 255),
+        egui::Color32::from_rgb(255, 255, 100),
+        egui::Color32::from_rgb(255, 100, 255),
+        egui::Color32::from_rgb(100, 255, 255),
+        egui::Color32::from_rgb(255, 150, 100),
+        egui::Color32::from_rgb(150, 100, 255),
+    ]
+}
+
+fn draw_oscilloscope_grid(
+    ui: &mut egui::Ui,
+    oscilloscope_data: &Arc<Mutex<OscilloscopeData>>,
+    selected_topics: &[String],
+) {
+    let osc_data = match oscilloscope_data.lock() {
+        Ok(data) => data,
+        Err(_) => {
+            ui.label("Error: Unable to access oscilloscope data");
+            return;
+        }
+    };
+
+    let current_time = osc_data.get_current_time();
+    let window_start = (current_time - OSCILLOSCOPE_TIME_WINDOW).max(0.0);
+    let colors = scope_colors();
+
+    let available_width = ui.available_width();
+    let num_cols = compute_columns(available_width, selected_topics.len());
+    let scope_width = (available_width / num_cols as f32) - ui.spacing().item_spacing.x;
+    // Height: fill available height divided by rows, but respect minimum
+    let available_height = ui.available_height();
+    let num_rows = (selected_topics.len() + num_cols - 1) / num_cols;
+    let scope_height = ((available_height / num_rows as f32) - ui.spacing().item_spacing.y)
+        .max(MIN_SCOPE_HEIGHT_PX);
+
+    // Total content height for scroll area
+    let total_height = scope_height * num_rows as f32
+        + ui.spacing().item_spacing.y * (num_rows as f32 - 1.0);
+
+    for (row_idx, chunk) in selected_topics.chunks(num_cols).enumerate() {
+        ui.horizontal(|ui| {
+            for (col_idx, topic) in chunk.iter().enumerate() {
+                let global_idx = row_idx * num_cols + col_idx;
+                let color = colors[global_idx % colors.len()];
+                let data = osc_data.get_data_in_window(topic);
+                let (y_min, y_max) = compute_y_range(&data);
+                let plot_id = format!("scope_{}_{}", row_idx, col_idx);
+
+                ui.allocate_ui(egui::vec2(scope_width, scope_height), |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(topic)
+                                .color(color)
+                                .size(14.0)
+                                .strong(),
+                        );
+
+                        Plot::new(&plot_id)
+                            .height(scope_height - 20.0)
+                            .width(scope_width)
+                            .legend(Legend::default().text_style(egui::TextStyle::Body))
+                            .show_axes([true, true])
+                            .show_grid([true, true])
+                            .allow_zoom(false)
+                            .allow_drag(false)
+                            .allow_scroll(false)
+                            .include_x(window_start)
+                            .include_x(current_time)
+                            .include_y(y_min)
+                            .include_y(y_max)
+                            .show(ui, |plot_ui| {
+                                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                                    [window_start, y_min],
+                                    [current_time, y_max],
+                                ));
+
+                                if !data.is_empty() {
+                                    let points: PlotPoints = data.into();
+                                    plot_ui.line(
+                                        Line::new(points)
+                                            .color(color)
+                                            .name(topic)
+                                            .width(2.0),
+                                    );
+                                }
+                            });
+                    });
+                });
+            }
+        });
+    }
+
+    // Ensure scroll area has enough space
+    let used = ui.min_rect().height();
+    if used < total_height {
+        ui.add_space(total_height - used);
+    }
+}
+
+/// Compute Y axis range with margin, auto-adjusted to data
+fn compute_y_range(data: &[[f64; 2]]) -> (f64, f64) {
+    if data.is_empty() {
+        return (-1.0, 1.0);
+    }
+
+    let y_min = data.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+    let y_max = data.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max);
+
+    if (y_max - y_min).abs() < 1e-10 {
+        return (y_min - 1.0, y_max + 1.0);
+    }
+
+    let margin = (y_max - y_min) * 0.1;
+    (y_min - margin, y_max + margin)
 }
 
 fn draw_tree(ui: &mut egui::Ui, node: &TopicNode, indent: usize, filter: &str) {
@@ -301,7 +595,7 @@ fn draw_tree(ui: &mut egui::Ui, node: &TopicNode, indent: usize, filter: &str) {
 
 fn draw_tree_with_path(ui: &mut egui::Ui, node: &TopicNode, indent: usize, filter: &str, parent_path: &str) {
     let indent_width = 20.0;
-    
+
     if !filter.is_empty() && !node.name.to_lowercase().contains(&filter.to_lowercase()) {
         let has_matching_child = node.children.values()
             .any(|child| matches_filter_recursive(child, filter));
@@ -321,8 +615,7 @@ fn draw_tree_with_path(ui: &mut egui::Ui, node: &TopicNode, indent: usize, filte
         ui.add_space(indent as f32 * indent_width);
 
         if !node.children.is_empty() {
-            let header_text = format!("📁 {}", node.name);
-            egui::CollapsingHeader::new(header_text)
+            egui::CollapsingHeader::new(format!("📁 {}", node.name))
                 .id_source(&current_path)
                 .default_open(indent < 2)
                 .show(ui, |ui| {
@@ -333,130 +626,41 @@ fn draw_tree_with_path(ui: &mut egui::Ui, node: &TopicNode, indent: usize, filte
         } else if !node.messages.is_empty() {
             let msg_count = node.messages.len();
             let latest_msg = node.messages.last().map(|(_, m)| m.as_str()).unwrap_or("");
-            let header_text = format!("📄 {} ({}) = {}", node.name, msg_count, 
-                if latest_msg.len() > 20 { 
-                    format!("{}...", &latest_msg[..20]) 
-                } else { 
-                    latest_msg.to_string() 
-                });
-            
+            let header_text = format!(
+                "📄 {} ({}) = {}",
+                node.name,
+                msg_count,
+                if latest_msg.len() > 20 {
+                    format!("{}...", &latest_msg[..20])
+                } else {
+                    latest_msg.to_string()
+                }
+            );
+
             egui::CollapsingHeader::new(header_text)
                 .id_source(&current_path)
                 .default_open(false)
                 .show(ui, |ui| {
-                    // Calculate height to show at least 5 messages
-                    // Each message line is approximately 20 pixels
-                    let min_height = 5.0 * 20.0; // At least 5 messages
-                    let max_height = 400.0;      // Maximum scroll area height
-                    
                     egui::ScrollArea::vertical()
-                        .min_scrolled_height(min_height)
-                        .max_height(max_height)
+                        .min_scrolled_height(5.0 * 20.0)
+                        .max_height(400.0)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 4.0;
-                            
-                            // Show most recent messages first
                             for (ts, msg) in node.messages.iter().rev().take(100) {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(ts.format("%H:%M:%S%.3f").to_string())
                                             .monospace()
                                             .small()
-                                            .color(egui::Color32::GRAY)
+                                            .color(egui::Color32::GRAY),
                                     );
-                                    ui.label(
-                                        egui::RichText::new(msg)
-                                            .monospace()
-                                            .small()
-                                    );
+                                    ui.label(egui::RichText::new(msg).monospace().small());
                                 });
                             }
                         });
                 });
         }
     });
-}
-
-fn draw_oscilloscope_realtime(
-    ui: &mut egui::Ui, 
-    oscilloscope_data: &Arc<Mutex<OscilloscopeData>>, 
-    selected_topics: &[String]
-) {
-    let osc_data = match oscilloscope_data.lock() {
-        Ok(data) => data,
-        Err(_) => {
-            ui.label("Error: Unable to access oscilloscope data");
-            return;
-        }
-    };
-    
-    let current_time = osc_data.get_current_time();
-    let window_start = (current_time - OSCILLOSCOPE_TIME_WINDOW).max(0.0);
-    
-    let colors = [
-        egui::Color32::from_rgb(255, 100, 100),
-        egui::Color32::from_rgb(100, 255, 100),
-        egui::Color32::from_rgb(100, 100, 255),
-        egui::Color32::from_rgb(255, 255, 100),
-        egui::Color32::from_rgb(255, 100, 255),
-        egui::Color32::from_rgb(100, 255, 255),
-        egui::Color32::from_rgb(255, 150, 100),
-        egui::Color32::from_rgb(150, 100, 255),
-    ];
-
-    let mut y_min = f64::INFINITY;
-    let mut y_max = f64::NEG_INFINITY;
-    
-    for topic in selected_topics {
-        let data = osc_data.get_data_in_window(topic);
-        for [_, y] in &data {
-            y_min = y_min.min(*y);
-            y_max = y_max.max(*y);
-        }
-    }
-    
-    if !y_min.is_finite() || !y_max.is_finite() || (y_max - y_min).abs() < 1e-10 {
-        y_min = -1.0;
-        y_max = 1.0;
-    } else {
-        let margin = (y_max - y_min) * 0.1;
-        y_min -= margin;
-        y_max += margin;
-    }
-
-    Plot::new("oscilloscope_realtime")
-        .legend(Legend::default())
-        .show_axes([true, true])
-        .show_grid([true, true])
-        .allow_zoom(false)
-        .allow_drag(false)
-        .allow_scroll(false)
-        .include_x(window_start)
-        .include_x(current_time)
-        .include_y(y_min)
-        .include_y(y_max)
-        .show(ui, |plot_ui| {
-            plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                [window_start, y_min],
-                [current_time, y_max]
-            ));
-            
-            for (idx, topic) in selected_topics.iter().enumerate() {
-                let data = osc_data.get_data_in_window(topic);
-                
-                if !data.is_empty() {
-                    let points: PlotPoints = data.into();
-                    let color = colors[idx % colors.len()];
-                    
-                    plot_ui.line(
-                        Line::new(points)
-                            .color(color)
-                            .name(topic)
-                            .width(2.0)
-                    );
-                }
-            }
-        });
 }
 
 fn matches_filter_recursive(node: &TopicNode, filter: &str) -> bool {
