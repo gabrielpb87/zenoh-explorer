@@ -4,7 +4,8 @@ use std::time::Duration;
 use std::collections::VecDeque;
 
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints, Legend, PlotBounds};
+use egui_plot::{Line, Plot, PlotPoints, Legend, PlotBounds, GridMark};
+
 use zenoh::Config;
 use crate::topic_node::{TopicNode, parse_numeric};
 
@@ -35,6 +36,8 @@ pub struct App {
     available_topics: Vec<String>,
     oscilloscope_data: Arc<Mutex<OscilloscopeData>>,
     frame_count: u64,
+    maximized_sent: bool,
+    last_screen_width: f32,
 }
 
 #[derive(Default)]
@@ -169,6 +172,8 @@ impl App {
             available_topics: Vec::new(),
             oscilloscope_data,
             frame_count: 0,
+            maximized_sent: false,
+            last_screen_width: 0.0, // 0.0 forces update on first frame
         }
     }
 
@@ -182,6 +187,38 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.maximized_sent {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            self.maximized_sent = true;
+        }
+
+        // ── Responsive scaling based on actual window width ──────────────
+        // Recalculates whenever the window is resized or moved to another monitor.
+        let screen_width = ctx.input(|i| i.screen_rect().width());
+        if (screen_width - self.last_screen_width).abs() > 1.0 {
+            // Map window width to a pixels_per_point that keeps UI proportional.
+            // These breakpoints cover common resolutions:
+            //   < 1280px wide  → compact (0.7)
+            //   1280–1920px    → medium  (0.85)
+            //   1920–2560px    → large   (1.0)
+            //   > 2560px       → scale up proportionally
+            let ppp = if screen_width < 1280.0 {
+                0.7
+            } else if screen_width < 1920.0 {
+                // Linear interpolation between 0.7 and 0.85
+                0.7 + (screen_width - 1280.0) / (1920.0 - 1280.0) * (0.85 - 0.7)
+            } else if screen_width < 2560.0 {
+                // Linear interpolation between 0.85 and 1.0
+                0.85 + (screen_width - 1920.0) / (2560.0 - 1920.0) * (1.0 - 0.85)
+            } else {
+                // Beyond 1440p: scale proportionally
+                (screen_width / 2560.0).clamp(1.0, 1.5)
+            };
+
+            ctx.set_pixels_per_point(ppp);
+            self.last_screen_width = screen_width;
+        }
+
         self.frame_count += 1;
         
         // Continuous repaint
@@ -425,7 +462,7 @@ fn draw_combined_scope(
     Plot::new("combined_scope")
         .height(MIN_COMBINED_SCOPE_HEIGHT_PX)
         .width(available_width)
-        .legend(Legend::default().text_style(egui::TextStyle::Body))
+        .legend(Legend::default().text_style(egui::TextStyle::Heading))
         .show_axes([true, true])
         .show_grid([true, true])
         .allow_zoom(false)
@@ -435,6 +472,24 @@ fn draw_combined_scope(
         .include_x(current_time)
         .include_y(y_min)
         .include_y(y_max)
+        // ── Force 1-second grid marks on X ──────────────────────────
+        .x_grid_spacer(|input| {
+            let mut marks = vec![];
+            // Use the actual visible bounds, not the full data range
+            let start = input.bounds.0.ceil() as i64;   // ceil: first mark INSIDE left edge
+            let end = input.bounds.1.floor() as i64;    // floor: last mark INSIDE right edge
+            let range = end - start;
+            let step = if range > 15 { 2i64 } else { 1i64 };
+            let mut t = start;
+            while t <= end {
+                marks.push(GridMark { value: t as f64, step_size: step as f64 });
+                t += step;
+            }
+            marks
+        })
+        .x_axis_formatter(|mark, _bounds| {
+            format!("{:.0}", mark.value)
+        })
         .show(ui, |plot_ui| {
             plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                 [window_start, y_min],
@@ -520,6 +575,10 @@ fn draw_oscilloscope_grid(
                 let data = osc_data.get_data_in_window(topic);
                 let (y_min, y_max) = compute_y_range(&data);
                 let plot_id = format!("scope_{}_{}", row_idx, col_idx);
+                let axis_font = egui::FontId::new(
+                    if scope_width < 450.0 { 9.0 } else { 11.0 },
+                    egui::FontFamily::Proportional,
+                );
 
                 ui.allocate_ui(egui::vec2(scope_width, scope_height), |ui| {
                     ui.vertical(|ui| {
@@ -533,7 +592,7 @@ fn draw_oscilloscope_grid(
                         Plot::new(&plot_id)
                             .height(scope_height - 20.0)
                             .width(scope_width)
-                            .legend(Legend::default().text_style(egui::TextStyle::Body))
+                            .legend(Legend::default().text_style(egui::TextStyle::Heading))
                             .show_axes([true, true])
                             .show_grid([true, true])
                             .allow_zoom(false)
@@ -543,6 +602,26 @@ fn draw_oscilloscope_grid(
                             .include_x(current_time)
                             .include_y(y_min)
                             .include_y(y_max)
+                            // ── Force 1-second grid marks on X ────────────────────────
+                            .x_grid_spacer(|input| {
+                                let mut marks = vec![];
+                                // Use the actual visible bounds, not the full data range
+                                let start = input.bounds.0.ceil() as i64;   // ceil: first mark INSIDE left edge
+                                let end = input.bounds.1.floor() as i64;    // floor: last mark INSIDE right edge
+                                let range = end - start;
+                                let step = if range > 15 { 2i64 } else { 1i64 };
+                                let mut t = start;
+                                while t <= end {
+                                    marks.push(GridMark { value: t as f64, step_size: step as f64 });
+                                    t += step;
+                                }
+                                marks
+                            })
+                            .x_axis_formatter(|mark, _| format!("{:.0}", mark.value))
+                            // ── Smaller axis label font on narrow scopes ──────────────
+                            .x_axis_label_style(egui::TextStyle::Name(
+                                if scope_width < 450.0 { "axis_small" } else { "axis_normal" }.into()
+                            ))
                             .show(ui, |plot_ui| {
                                 plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                                     [window_start, y_min],
@@ -616,7 +695,7 @@ fn draw_tree_with_path(ui: &mut egui::Ui, node: &TopicNode, indent: usize, filte
 
         if !node.children.is_empty() {
             egui::CollapsingHeader::new(format!("📁 {}", node.name))
-                .id_source(&current_path)
+                .id_salt(&current_path)
                 .default_open(indent < 2)
                 .show(ui, |ui| {
                     for child in node.children.values() {
@@ -638,7 +717,7 @@ fn draw_tree_with_path(ui: &mut egui::Ui, node: &TopicNode, indent: usize, filte
             );
 
             egui::CollapsingHeader::new(header_text)
-                .id_source(&current_path)
+                .id_salt(&current_path)
                 .default_open(false)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()

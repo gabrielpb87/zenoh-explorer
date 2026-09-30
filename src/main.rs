@@ -35,11 +35,39 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_inner_size(egui::vec2(1200.0, 800.0))
-            .with_min_inner_size(egui::vec2(800.0, 600.0))
-            .with_maximized(true), // <-- maximized at startup
+            .with_min_inner_size(egui::vec2(800.0, 600.0)),
         ..Default::default()
     };
+
+    // let result = eframe::run_native(
+    //     "Zenoh Explorer",
+    //     options,
+    //     Box::new(move |cc| {
+    //         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+
+    //         // ── Dynamic DPI scaling based on actual screen size ──────────
+    //         // Read the native pixels_per_point reported by the OS/driver
+    //         let native_ppp = cc.egui_ctx.pixels_per_point();
+
+    //         // Query the monitor's physical pixel dimensions via the viewport
+    //         let screen_size_px = cc.egui_ctx.input(|i| i.screen_rect());
+
+    //         // Logical screen width in egui points at native DPI
+    //         let logical_width = screen_size_px.width();
+
+    //         // Target logical width: we want the UI to look as if designed for
+    //         // a 1920-wide logical canvas, regardless of physical resolution.
+    //         let target_logical_width = 1920.0_f32;
+
+    //         // Compute the scale factor needed to fit our target into actual screen
+    //         let scale = (logical_width / target_logical_width).clamp(0.5, 2.0);
+
+    //         // Apply: multiply native ppp by our scale to get consistent sizing
+    //         cc.egui_ctx.set_pixels_per_point(native_ppp * scale);
+
+    //         Ok(Box::new(crate::ui::App::new(config_path.as_deref())) as Box<dyn eframe::App>)
+    //     })
+    // );
 
     let result = eframe::run_native(
         "Zenoh Explorer",
