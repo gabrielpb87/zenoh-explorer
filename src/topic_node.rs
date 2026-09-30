@@ -92,11 +92,14 @@ impl TopicNode {
     }
 }
 
-/// Parse a string as f64, also accepting "true"/"false" (case-insensitive).
+/// Parse a string as f64, accepting "true"/"false", signed numbers like "+5.0"/"-5.0",
+/// and quoted variants like `"+5.0"`.
 pub fn parse_numeric(s: &str) -> Option<f64> {
-    let trimmed = s.trim();
+    // Strip outer whitespace, then optional surrounding quotes
+    let trimmed = s.trim().trim_matches('"').trim();
+
     match trimmed.to_lowercase().as_str() {
-        "true" => Some(1.0),
+        "true"  => Some(1.0),
         "false" => Some(0.0),
         _ => trimmed.parse::<f64>().ok(),
     }

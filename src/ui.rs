@@ -248,7 +248,7 @@ impl eframe::App for App {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Clear All").clicked() {
+                    if ui.button("Clear all data graphs").clicked() {
                         if let Ok(mut tree) = self.topic_root.lock() {
                             tree.clear_all_messages();
                         }
@@ -282,6 +282,52 @@ impl eframe::App for App {
                     .default_width(260.0)
                     .show(ctx, |ui| {
                         ui.heading("Select Topics");
+                        ui.separator();
+
+                        // ── Bulk selection buttons ────────────────────────────────
+                        let numeric_topics: Vec<String> = {
+                            let osc_data = self.oscilloscope_data.lock().ok();
+                            self.available_topics
+                                .iter()
+                                .filter(|t| {
+                                    osc_data
+                                        .as_ref()
+                                        .and_then(|d| d.topic_data.get(*t))
+                                        .map(|d| !d.is_empty())
+                                        .unwrap_or(false)
+                                })
+                                .cloned()
+                                .collect()
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label("Individual:");
+                            if ui.button("All").clicked() {
+                                for t in &numeric_topics {
+                                    if !self.selected_topics.contains(t) {
+                                        self.selected_topics.push(t.clone());
+                                    }
+                                }
+                            }
+                            if ui.button("None").clicked() {
+                                self.selected_topics.clear();
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Combined: ");
+                            if ui.button("All").clicked() {
+                                for t in &numeric_topics {
+                                    if !self.combined_scope_topics.contains(t) {
+                                        self.combined_scope_topics.push(t.clone());
+                                    }
+                                }
+                            }
+                            if ui.button("None").clicked() {
+                                self.combined_scope_topics.clear();
+                            }
+                        });
+
                         ui.separator();
 
                         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -344,14 +390,6 @@ impl eframe::App for App {
                         });
 
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui.button("Clear Selection").clicked() {
-                                self.selected_topics.clear();
-                            }
-                            if ui.button("Clear Combined").clicked() {
-                                self.combined_scope_topics.clear();
-                            }
-                        });
                     });
 
                 // ── Central panel: combined scope + individual grid ──────────
@@ -575,10 +613,6 @@ fn draw_oscilloscope_grid(
                 let data = osc_data.get_data_in_window(topic);
                 let (y_min, y_max) = compute_y_range(&data);
                 let plot_id = format!("scope_{}_{}", row_idx, col_idx);
-                let axis_font = egui::FontId::new(
-                    if scope_width < 450.0 { 9.0 } else { 11.0 },
-                    egui::FontFamily::Proportional,
-                );
 
                 ui.allocate_ui(egui::vec2(scope_width, scope_height), |ui| {
                     ui.vertical(|ui| {
@@ -618,10 +652,6 @@ fn draw_oscilloscope_grid(
                                 marks
                             })
                             .x_axis_formatter(|mark, _| format!("{:.0}", mark.value))
-                            // ── Smaller axis label font on narrow scopes ──────────────
-                            .x_axis_label_style(egui::TextStyle::Name(
-                                if scope_width < 450.0 { "axis_small" } else { "axis_normal" }.into()
-                            ))
                             .show(ui, |plot_ui| {
                                 plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                                     [window_start, y_min],
